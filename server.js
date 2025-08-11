@@ -1,3 +1,4 @@
+// server.js
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -11,7 +12,7 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const BASE_URL = process.env.BASE_URL; // e.g., https://portal.yourdomain.com
+const BASE_URL = process.env.BASE_URL; // e.g., https://<service>.onrender.com
 const STATE_SECRET = process.env.STATE_SECRET || crypto.randomBytes(32).toString('hex');
 const CLOVER_ENV = (process.env.CLOVER_ENV || 'sandbox').toLowerCase();
 
@@ -21,13 +22,12 @@ const CLOVER_HOSTS = {
 }[CLOVER_ENV];
 
 const APP_ID = process.env.CLOVER_APP_ID;
-const APP_SECRET = process.env.CLOVER_APP_SECRET; // for server-side (high-trust) flow
+const APP_SECRET = process.env.CLOVER_APP_SECRET; // server-side (high-trust) flow
 
 // --- guards ---
-if (!BASE_URL) throw new Error('BASE_URL is required');
-if (!/^https:\/\//.test(BASE_URL)) console.warn('[WARN] BASE_URL should be https in production');
+if (!BASE_URL) throw new Error('BASE_URL is required (your public portal URL)');
 if (!APP_ID) throw new Error('CLOVER_APP_ID is required');
-if (!APP_SECRET) console.warn('[WARN] CLOVER_APP_SECRET missing. If you plan PKCE later, that’s fine; this sample uses server secret.');
+if (!APP_SECRET) console.warn('[WARN] CLOVER_APP_SECRET missing — this sample expects server-side secret.');
 
 // --- middleware ---
 app.use(helmet());
@@ -36,7 +36,7 @@ app.use(morgan('combined'));
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// --- very small file "DB" (fine for pilots; replace with Postgres later) ---
+// --- tiny file "DB" (replace with Postgres for real) ---
 const DB_FILE = path.join(__dirname, 'data', 'db.json');
 fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
 if (!fs.existsSync(DB_FILE)) fs.writeFileSync(DB_FILE, JSON.stringify({ tenants: {}, tokens: {} }, null, 2));
@@ -66,8 +66,6 @@ const API_BASE  = CLOVER_HOSTS.api;
 app.get('/health', (_, res) => res.json({ status: 'OK', env: CLOVER_ENV, timestamp: nowIso() }));
 
 // ========== PORTAL UI ==========
-
-// Landing: create/select a tenant (merchant record)
 app.get('/', (req, res) => res.redirect('/portal'));
 
 app.get('/portal', (req, res) => {
@@ -117,7 +115,7 @@ app.get('/portal/tenant/:tid', (req, res) => {
   res.status(200).send(`
 <!doctype html>
 <html>
-  <head><title>${t.businessName} — Portal</title></head>
+  <head><title>${t.businessName} — Merchant Portal</title></head>
   <body style="font-family: system-ui, sans-serif; max-width: 800px; margin: 40px auto;">
     <h2>${t.businessName} — Merchant Portal</h2>
     <p><strong>Email:</strong> ${t.email}</p>
@@ -128,13 +126,15 @@ app.get('/portal/tenant/:tid', (req, res) => {
       <form method="POST" action="/portal/reconnect/${t.id}" style="display:inline-block;margin-right:8px">
         <button type="submit">Reconnect</button>
       </form>
-      <form method="POST" action="/portal/disconnect/${t.id}" style="display:inline-block">
+      <a href="/portal/reconnect/${t.id}">Use link instead</a>
+      <form method="POST" action="/portal/disconnect/${t.id}" style="margin-top:8px">
         <button type="submit">Disconnect</button>
       </form>
     ` : `
-      <form method="POST" action="/portal/connect/${t.id}">
+      <form method="POST" action="/portal/connect/${t.id}" style="display:inline-block;margin-right:8px">
         <button type="submit">Connect Clover</button>
       </form>
+      <a href="/portal/connect/${t.id}">Use link instead</a>
     `}
     <hr/>
     <h3>Quick Tests</h3>
@@ -147,39 +147,29 @@ app.get('/portal/tenant/:tid', (req, res) => {
 </html>`);
 });
 
-// begin OAuth
-app.post('/portal/connect/:tid', (req, res) => {
+// ---- shared handler so GET or POST both work ----
+function startCloverAuth(req, res) {
   const db = readDB();
   const t = db.tenants[req.params.tid];
   if (!t) return res.status(404).send('Tenant not found');
+
   const state = signState({ tid: t.id, ts: Date.now(), nonce: crypto.randomUUID() });
   const redirectUri = `${BASE_URL}/oauth/callback`;
   const params = new URLSearchParams({
-    client_id: process.env.CLOVER_APP_ID,
+    client_id: APP_ID,
     response_type: 'code',
     redirect_uri: redirectUri,
     state
   });
-  return res.redirect(`${AUTH_BASE}/oauth/v2/authorize?${params.toString()}`);
-});
 
-// reconnect = same as connect
-app.post('/portal/reconnect/:tid', (req, res) => {
-  const db = readDB();
-  const t = db.tenants[req.params.tid];
-  if (!t) return res.status(404).send('Tenant not found');
-  const state = signState({ tid: t.id, ts: Date.now(), nonce: crypto.randomUUID() });
-  const redirectUri = `${BASE_URL}/oauth/callback`;
-  const params = new URLSearchParams({
-    client_id: process.env.CLOVER_APP_ID,
-    response_type: 'code',
-    redirect_uri: redirectUri,
-    state
-  });
-  return res.redirect(`${AUTH_BASE}/oauth/v2/authorize?${params.toString()}`);
-});
+  const authURL = `${AUTH_BASE}/oauth/v2/authorize?${params.toString()}`;
+  console.log('[clover] authorize URL ->', authURL);
+  return res.redirect(authURL);
+}
+app.all('/portal/connect/:tid', startCloverAuth);
+app.all('/portal/reconnect/:tid', startCloverAuth);
 
-// disconnect (forget tokens locally)
+// disconnect (local only)
 app.post('/portal/disconnect/:tid', (req, res) => {
   const db = readDB();
   const t = db.tenants[req.params.tid];
@@ -191,7 +181,7 @@ app.post('/portal/disconnect/:tid', (req, res) => {
   res.redirect(`/portal/tenant/${t.id}`);
 });
 
-// OAuth callback
+// ---- OAuth callback ----
 app.get('/oauth/callback', async (req, res) => {
   try {
     const { code, merchant_id, state } = req.query;
@@ -210,7 +200,7 @@ app.get('/oauth/callback', async (req, res) => {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         client_id: APP_ID,
-        client_secret: APP_SECRET, // PKCE path would use code_verifier instead
+        client_secret: APP_SECRET, // for PKCE, replace with code_verifier
         code: String(code)
       })
     });
@@ -223,14 +213,13 @@ app.get('/oauth/callback', async (req, res) => {
     const { access_token, refresh_token, expires_in } = tokenJson;
     const expires_at = Date.now() + (expires_in || 0) * 1000;
 
-    // store
     db.tokens[String(merchant_id)] = {
       access_token, refresh_token, expires_at, tenantId: t.id
     };
     t.merchant_id = String(merchant_id);
     t.connectedAt = nowIso();
 
-    // optional: fetch merchant name to display
+    // optional nicety: fetch merchant name
     try {
       const r = await fetch(`${API_BASE}/v3/merchants/${merchant_id}`, {
         headers: { Authorization: `Bearer ${access_token}`, Accept: 'application/json' }
@@ -249,12 +238,12 @@ app.get('/oauth/callback', async (req, res) => {
   }
 });
 
-// token helper
+// ---- token helper & demo API ----
 async function ensureFreshToken(db, merchantId) {
   const rec = db.tokens[merchantId];
   if (!rec) throw new Error('Not connected');
   if (rec.expires_at && Date.now() < rec.expires_at - 60_000) return rec;
-  // refresh:
+
   const r = await fetch(`${API_BASE}/oauth/v2/refresh`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -275,7 +264,6 @@ async function ensureFreshToken(db, merchantId) {
   return rec;
 }
 
-// demo API buttons
 app.get('/portal/api/me/:tid', async (req, res) => {
   const db = readDB();
   const t = db.tenants[req.params.tid];

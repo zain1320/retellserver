@@ -1,266 +1,322 @@
-// server.js
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
 require('dotenv').config();
-
 const fetch = require('node-fetch'); // npm i node-fetch@2
 const crypto = require('crypto');
-
-const Retell = require('retell-sdk').default;
-const retellClient = new Retell({ apiKey: process.env.RETELL_API_KEY });
-
-// Clover constants
-const CLOVER_AUTH_BASE = 'https://sandbox.dev.clover.com';
-const CLOVER_API_BASE  = 'https://apisandbox.dev.clover.com';
-
-const APP_ID     = process.env.CLOVER_APP_ID;       // Clover App ID (client_id)
-const APP_SECRET = process.env.CLOVER_APP_SECRET;   // keep for high-trust; omit for PKCE
-const BASE_URL   = process.env.BASE_URL || 'http://localhost:3000';
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ---------- security & middleware ----------
-// Allow being embedded by Clover; avoid CSP/frame blocking inside Clover iframe
-app.use(helmet({ contentSecurityPolicy: false, frameguard: false }));
-app.use((req, res, next) => {
-  res.setHeader(
-    'Content-Security-Policy',
-    "frame-ancestors 'self' https://*.clover.com https://*.dev.clover.com"
-  );
-  next();
-});
+const BASE_URL = process.env.BASE_URL; // e.g., https://portal.yourdomain.com
+const STATE_SECRET = process.env.STATE_SECRET || crypto.randomBytes(32).toString('hex');
+const CLOVER_ENV = (process.env.CLOVER_ENV || 'sandbox').toLowerCase();
 
+const CLOVER_HOSTS = {
+  sandbox: { authorize: 'https://sandbox.dev.clover.com', api: 'https://apisandbox.dev.clover.com' },
+  prod:    { authorize: 'https://clover.com',              api: 'https://api.clover.com' }
+}[CLOVER_ENV];
+
+const APP_ID = process.env.CLOVER_APP_ID;
+const APP_SECRET = process.env.CLOVER_APP_SECRET; // for server-side (high-trust) flow
+
+// --- guards ---
+if (!BASE_URL) throw new Error('BASE_URL is required');
+if (!/^https:\/\//.test(BASE_URL)) console.warn('[WARN] BASE_URL should be https in production');
+if (!APP_ID) throw new Error('CLOVER_APP_ID is required');
+if (!APP_SECRET) console.warn('[WARN] CLOVER_APP_SECRET missing. If you plan PKCE later, that’s fine; this sample uses server secret.');
+
+// --- middleware ---
+app.use(helmet());
 app.use(cors());
 app.use(morgan('combined'));
-app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
 
-// ---------- simple home so Clover gets 200 ----------
-app.get('/', (req, res) => {
+// --- very small file "DB" (fine for pilots; replace with Postgres later) ---
+const DB_FILE = path.join(__dirname, 'data', 'db.json');
+fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
+if (!fs.existsSync(DB_FILE)) fs.writeFileSync(DB_FILE, JSON.stringify({ tenants: {}, tokens: {} }, null, 2));
+
+function readDB() { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
+function writeDB(db) { fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2)); }
+
+// helpers
+const nowIso = () => new Date().toISOString();
+const signState = (obj) => {
+  const payload = Buffer.from(JSON.stringify(obj)).toString('base64url');
+  const sig = crypto.createHmac('sha256', STATE_SECRET).update(payload).digest('base64url');
+  return `${payload}.${sig}`;
+};
+const verifyState = (state) => {
+  const [payload, sig] = (state || '').split('.');
+  if (!payload || !sig) return null;
+  const expected = crypto.createHmac('sha256', STATE_SECRET).update(payload).digest('base64url');
+  if (sig !== expected) return null;
+  try { return JSON.parse(Buffer.from(payload, 'base64url').toString()); } catch { return null; }
+};
+
+const AUTH_BASE = CLOVER_HOSTS.authorize;
+const API_BASE  = CLOVER_HOSTS.api;
+
+// --- health ---
+app.get('/health', (_, res) => res.json({ status: 'OK', env: CLOVER_ENV, timestamp: nowIso() }));
+
+// ========== PORTAL UI ==========
+
+// Landing: create/select a tenant (merchant record)
+app.get('/', (req, res) => res.redirect('/portal'));
+
+app.get('/portal', (req, res) => {
+  const db = readDB();
+  const list = Object.values(db.tenants);
   res.status(200).send(`
-    <!doctype html>
-    <html><body>
-      <h3>zainApp server</h3>
-      <p><a href="/oauth/start">Connect Clover (sandbox)</a></p>
-    </body></html>
-  `);
+<!doctype html>
+<html>
+  <head><title>Merchant Portal</title></head>
+  <body style="font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto;">
+    <h2>Merchant Portal</h2>
+    <p>Create an entry for a restaurant, then connect Clover.</p>
+    <form method="POST" action="/portal/start" style="display:flex; flex-direction:column; gap:8px; max-width:420px;">
+      <label>Business Name <input name="businessName" required /></label>
+      <label>Email <input name="email" type="email" required /></label>
+      <button type="submit">Continue</button>
+    </form>
+    <hr/>
+    <h3>Existing</h3>
+    <ul>
+      ${list.map(t => `
+        <li>
+          <a href="/portal/tenant/${t.id}">${t.businessName}</a>
+          ${t.merchant_id ? ' — <strong>Connected</strong>' : ' — <em>Not connected</em>'}
+        </li>`).join('')}
+    </ul>
+  </body>
+</html>`);
 });
 
-// ---------- health ----------
-app.get('/health', (_, res) =>
-  res.json({ status: 'OK', timestamp: new Date().toISOString() })
-);
+app.post('/portal/start', (req, res) => {
+  const id = crypto.randomUUID();
+  const businessName = String(req.body.businessName || '').trim();
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const db = readDB();
+  db.tenants[id] = { id, businessName, email, createdAt: nowIso() };
+  writeDB(db);
+  res.redirect(`/portal/tenant/${id}`);
+});
 
-// ---------- Clover OAuth ----------
-const merchantTokens = new Map(); // merchantId -> { access_token, refresh_token, expires_at }
+app.get('/portal/tenant/:tid', (req, res) => {
+  const db = readDB();
+  const t = db.tenants[req.params.tid];
+  if (!t) return res.status(404).send('Tenant not found');
+  const token = t.merchant_id ? db.tokens[t.merchant_id] : null;
+  const connected = Boolean(t.merchant_id && token);
+  res.status(200).send(`
+<!doctype html>
+<html>
+  <head><title>${t.businessName} — Portal</title></head>
+  <body style="font-family: system-ui, sans-serif; max-width: 800px; margin: 40px auto;">
+    <h2>${t.businessName} — Merchant Portal</h2>
+    <p><strong>Email:</strong> ${t.email}</p>
+    <h3>Connection</h3>
+    <p>Status: ${connected ? '<span style="color:green">Connected</span>' : '<span style="color:#b00">Not connected</span>'}</p>
+    ${connected ? `
+      <p><strong>merchant_id:</strong> ${t.merchant_id}</p>
+      <form method="POST" action="/portal/reconnect/${t.id}" style="display:inline-block;margin-right:8px">
+        <button type="submit">Reconnect</button>
+      </form>
+      <form method="POST" action="/portal/disconnect/${t.id}" style="display:inline-block">
+        <button type="submit">Disconnect</button>
+      </form>
+    ` : `
+      <form method="POST" action="/portal/connect/${t.id}">
+        <button type="submit">Connect Clover</button>
+      </form>
+    `}
+    <hr/>
+    <h3>Quick Tests</h3>
+    <ul>
+      <li><a href="/portal/api/me/${t.id}">Fetch Merchant (GET /v3/merchants/{id})</a></li>
+      <li><a href="/portal/api/items/${t.id}?limit=10">List Items (GET /items)</a></li>
+    </ul>
+    <p style="margin-top:24px"><a href="/portal">← Back</a></p>
+  </body>
+</html>`);
+});
 
-/**
- * START OAuth
- * Clover opens your app in an iframe; use top-level redirect so the authorize page isn't framed.
- */
-app.get('/oauth/start', (req, res) => {
-  const state = crypto.randomBytes(16).toString('hex'); // optional: persist/verify if you add a session
+// begin OAuth
+app.post('/portal/connect/:tid', (req, res) => {
+  const db = readDB();
+  const t = db.tenants[req.params.tid];
+  if (!t) return res.status(404).send('Tenant not found');
+  const state = signState({ tid: t.id, ts: Date.now(), nonce: crypto.randomUUID() });
   const redirectUri = `${BASE_URL}/oauth/callback`;
-
   const params = new URLSearchParams({
-    client_id: APP_ID,
+    client_id: process.env.CLOVER_APP_ID,
     response_type: 'code',
     redirect_uri: redirectUri,
     state
   });
-
-  const authURL = `${CLOVER_AUTH_BASE}/oauth/v2/authorize?${params.toString()}`;
-  console.log('[clover] authorize URL ->', authURL);
-
-  // Send small HTML that forces the parent window (outside iframe) to navigate
-  res.status(200).send(`
-    <!doctype html>
-    <html>
-      <head>
-        <meta http-equiv="refresh" content="0; url='${authURL}'" />
-      </head>
-      <body>
-        <script>
-          // escape Clover iframe to top window
-          window.top.location.href = ${JSON.stringify(authURL)};
-        </script>
-        <noscript>
-          <a href="${authURL}" target="_top">Continue to Clover</a>
-        </noscript>
-      </body>
-    </html>
-  `);
+  return res.redirect(`${AUTH_BASE}/oauth/v2/authorize?${params.toString()}`);
 });
 
-/**
- * CALLBACK
- * Clover redirects here with ?code=...&merchant_id=...
- * Exchange code -> tokens and store them.
- */
+// reconnect = same as connect
+app.post('/portal/reconnect/:tid', (req, res) => {
+  const db = readDB();
+  const t = db.tenants[req.params.tid];
+  if (!t) return res.status(404).send('Tenant not found');
+  const state = signState({ tid: t.id, ts: Date.now(), nonce: crypto.randomUUID() });
+  const redirectUri = `${BASE_URL}/oauth/callback`;
+  const params = new URLSearchParams({
+    client_id: process.env.CLOVER_APP_ID,
+    response_type: 'code',
+    redirect_uri: redirectUri,
+    state
+  });
+  return res.redirect(`${AUTH_BASE}/oauth/v2/authorize?${params.toString()}`);
+});
+
+// disconnect (forget tokens locally)
+app.post('/portal/disconnect/:tid', (req, res) => {
+  const db = readDB();
+  const t = db.tenants[req.params.tid];
+  if (!t) return res.status(404).send('Tenant not found');
+  if (t.merchant_id) delete db.tokens[t.merchant_id];
+  t.merchant_id = undefined;
+  t.connectedAt = undefined;
+  writeDB(db);
+  res.redirect(`/portal/tenant/${t.id}`);
+});
+
+// OAuth callback
 app.get('/oauth/callback', async (req, res) => {
   try {
-    const { code, merchant_id } = req.query;
-    if (!code || !merchant_id) {
-      return res.status(400).send('Missing code or merchant_id');
-    }
+    const { code, merchant_id, state } = req.query;
+    if (!code || !merchant_id || !state) return res.status(400).send('Missing parameters');
 
-    const body = {
-      client_id: APP_ID,
-      // For PKCE (low-trust) remove client_secret and include code_verifier instead.
-      client_secret: APP_SECRET,
-      code: String(code)
-    };
+    const parsed = verifyState(String(state));
+    if (!parsed || !parsed.tid) return res.status(400).send('Invalid state');
 
-    const r = await fetch(`${CLOVER_API_BASE}/oauth/v2/token`, {
+    const db = readDB();
+    const t = db.tenants[parsed.tid];
+    if (!t) return res.status(400).send('Unknown tenant');
+
+    // exchange code -> tokens
+    const tokenResp = await fetch(`${API_BASE}/oauth/v2/token`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body)
+      body: JSON.stringify({
+        client_id: APP_ID,
+        client_secret: APP_SECRET, // PKCE path would use code_verifier instead
+        code: String(code)
+      })
     });
-    const j = await r.json();
-
-    if (!r.ok) {
-      console.error('Token exchange failed:', j);
-      return res.status(r.status).send(`Token exchange failed: ${JSON.stringify(j)}`);
+    const tokenJson = await tokenResp.json();
+    if (!tokenResp.ok) {
+      console.error('Token exchange failed:', tokenJson);
+      return res.status(tokenResp.status).send(`Token exchange failed: ${JSON.stringify(tokenJson)}`);
     }
 
-    const { access_token, refresh_token, expires_in } = j;
-    merchantTokens.set(String(merchant_id), {
-      access_token,
-      refresh_token,
-      expires_at: Date.now() + (expires_in || 0) * 1000
-    });
+    const { access_token, refresh_token, expires_in } = tokenJson;
+    const expires_at = Date.now() + (expires_in || 0) * 1000;
 
-    res
-      .status(200)
-      .send(
-        `Clover connected for merchant ${merchant_id}. ` +
-        `Try <a href="/clover/me?merchant_id=${merchant_id}">/clover/me</a> or ` +
-        `<a href="/clover/items?merchant_id=${merchant_id}">/clover/items</a>.`
-      );
+    // store
+    db.tokens[String(merchant_id)] = {
+      access_token, refresh_token, expires_at, tenantId: t.id
+    };
+    t.merchant_id = String(merchant_id);
+    t.connectedAt = nowIso();
+
+    // optional: fetch merchant name to display
+    try {
+      const r = await fetch(`${API_BASE}/v3/merchants/${merchant_id}`, {
+        headers: { Authorization: `Bearer ${access_token}`, Accept: 'application/json' }
+      });
+      const j = await r.json();
+      if (r.ok && j && j.name && (!t.businessName || t.businessName === '')) {
+        t.businessName = j.name;
+      }
+    } catch {}
+
+    writeDB(db);
+    return res.redirect(`/portal/tenant/${t.id}`);
   } catch (e) {
     console.error('OAuth callback error:', e);
-    res.status(500).send('OAuth callback error');
+    return res.status(500).send('OAuth callback error');
   }
 });
 
-// Quick test: merchant details
-app.get('/clover/me', async (req, res) => {
-  const merchantId = String(req.query.merchant_id || '');
-  const t = merchantTokens.get(merchantId);
-  if (!t) return res.status(400).send('No token stored for that merchant_id');
-
-  const r = await fetch(`${CLOVER_API_BASE}/v3/merchants/${merchantId}`, {
-    headers: { Authorization: `Bearer ${t.access_token}`, Accept: 'application/json' }
+// token helper
+async function ensureFreshToken(db, merchantId) {
+  const rec = db.tokens[merchantId];
+  if (!rec) throw new Error('Not connected');
+  if (rec.expires_at && Date.now() < rec.expires_at - 60_000) return rec;
+  // refresh:
+  const r = await fetch(`${API_BASE}/oauth/v2/refresh`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      client_id: APP_ID,
+      client_secret: APP_SECRET,
+      refresh_token: rec.refresh_token
+    })
   });
-  const json = await r.json();
-  res.status(r.ok ? 200 : r.status).json(json);
-});
+  const j = await r.json();
+  if (!r.ok) throw new Error(`Refresh failed: ${JSON.stringify(j)}`);
+  const { access_token, refresh_token, expires_in } = j;
+  rec.access_token = access_token;
+  if (refresh_token) rec.refresh_token = refresh_token;
+  rec.expires_at = Date.now() + (expires_in || 0) * 1000;
+  db.tokens[merchantId] = rec;
+  writeDB(db);
+  return rec;
+}
 
-// Quick test: items list
-app.get('/clover/items', async (req, res) => {
-  const merchantId = String(req.query.merchant_id || '');
-  const limit = req.query.limit || '5';
-  const t = merchantTokens.get(merchantId);
-  if (!t) return res.status(400).send('No token stored for that merchant_id');
-
-  const r = await fetch(`${CLOVER_API_BASE}/v3/merchants/${merchantId}/items?limit=${limit}`, {
-    headers: { Authorization: `Bearer ${t.access_token}`, Accept: 'application/json' }
-  });
-  const json = await r.json();
-  res.status(r.ok ? 200 : r.status).json(json);
-});
-
-// ---------- Retell endpoints (unchanged) ----------
-app.get('/api/calls/:callId', async (req, res) => {
+// demo API buttons
+app.get('/portal/api/me/:tid', async (req, res) => {
+  const db = readDB();
+  const t = db.tenants[req.params.tid];
+  if (!t || !t.merchant_id) return res.status(400).send('Tenant not connected');
   try {
-    const { callId } = req.params;
-    const callDetails = await retellClient.call.getCall(callId);
-    res.json({ success: true, data: callDetails });
-  } catch (error) {
-    console.error('Error fetching call details:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.get('/api/calls/:callId/transcript', async (req, res) => {
-  try {
-    const { callId } = req.params;
-    const callDetails = await retellClient.call.getCall(callId);
-    const transcript = callDetails.transcript || [];
-    const variables = callDetails.variables || {};
-    res.json({
-      success: true,
-      data: {
-        callId,
-        transcript,
-        variables,
-        metadata: {
-          duration: callDetails.duration,
-          status: callDetails.status,
-          startTime: callDetails.start_time,
-          endTime: callDetails.end_time
-        }
-      }
+    const tok = await ensureFreshToken(db, t.merchant_id);
+    const r = await fetch(`${API_BASE}/v3/merchants/${t.merchant_id}`, {
+      headers: { Authorization: `Bearer ${tok.access_token}`, Accept: 'application/json' }
     });
-  } catch (error) {
-    console.error('Error fetching call transcript:', error);
-    res.status(500).json({ success: false, error: error.message });
+    const j = await r.json();
+    return res.status(r.ok ? 200 : r.status).type('json').send(j);
+  } catch (e) {
+    return res.status(500).send(e.message);
   }
 });
 
-app.post('/api/calls/:callId/extract-variables', async (req, res) => {
+app.get('/portal/api/items/:tid', async (req, res) => {
+  const db = readDB();
+  const t = db.tenants[req.params.tid];
+  if (!t || !t.merchant_id) return res.status(400).send('Tenant not connected');
+  const limit = req.query.limit || '10';
   try {
-    const { callId } = req.params;
-    const { name, ordered_items, phone_number } = req.body;
-    res.json({ success: true, data: { callId, name, ordered_items, phone_number } });
-  } catch (error) {
-    console.error('Error extracting variables:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.get('/api/agents/:agentId/calls', async (req, res) => {
-  try {
-    const { agentId } = req.params;
-    const { limit = 10, offset = 0 } = req.query;
-    const calls = await retellClient.call.listCalls({
-      agentId,
-      limit: parseInt(limit),
-      offset: parseInt(offset)
+    const tok = await ensureFreshToken(db, t.merchant_id);
+    const r = await fetch(`${API_BASE}/v3/merchants/${t.merchant_id}/items?limit=${encodeURIComponent(limit)}`, {
+      headers: { Authorization: `Bearer ${tok.access_token}`, Accept: 'application/json' }
     });
-    res.json({ success: true, data: calls });
-  } catch (error) {
-    console.error('Error fetching agent calls:', error);
-    res.status(500).json({ success: false, error: error.message });
+    const j = await r.json();
+    return res.status(r.ok ? 200 : r.status).type('json').send(j);
+  } catch (e) {
+    return res.status(500).send(e.message);
   }
 });
 
-app.post('/webhook/call-events', (req, res) => {
-  try {
-    const event = req.body;
-    console.log('Received call event:', event);
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Error processing webhook:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// ---------- errors & 404 ----------
+// 404 & errors
+app.use((req, res) => res.status(404).send('Not found'));
 app.use((err, req, res, next) => {
-  console.error(err.stack);
-  res.status(500).json({ success: false, error: 'Something went wrong!' });
-});
-
-app.use('*', (req, res) => {
-  res.status(404).json({ success: false, error: 'Endpoint not found' });
+  console.error(err); res.status(500).send('Server error');
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-  console.log(`Health: ${BASE_URL}/health`);
-  console.log(`OAuth start: ${BASE_URL}/oauth/start`);
+  console.log(`Portal listening on :${PORT}`);
+  console.log(`Open ${BASE_URL}/portal`);
+  console.log(`Clover env=${CLOVER_ENV}  Auth=${AUTH_BASE}  API=${API_BASE}`);
 });

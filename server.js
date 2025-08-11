@@ -5,63 +5,69 @@ const helmet = require('helmet');
 const morgan = require('morgan');
 require('dotenv').config();
 
-const Retell = require('retell-sdk').default;
-const retellClient = new Retell({
-  apiKey: process.env.RETELL_API_KEY,
-});
-
-// === Clover OAuth constants ===
 const fetch = require('node-fetch'); // npm i node-fetch@2
 const crypto = require('crypto');
+
+const Retell = require('retell-sdk').default;
+const retellClient = new Retell({ apiKey: process.env.RETELL_API_KEY });
 
 const CLOVER_AUTH_BASE = 'https://sandbox.dev.clover.com';
 const CLOVER_API_BASE  = 'https://apisandbox.dev.clover.com';
 
-const APP_ID     = process.env.CLOVER_APP_ID;     // required
-const APP_SECRET = process.env.CLOVER_APP_SECRET; // required for high-trust (server) flow
-const BASE_URL   = process.env.BASE_URL;          // e.g., https://retellserver.onrender.com
-
-if (!APP_ID || !BASE_URL) {
-  console.warn('[WARN] Missing CLOVER_APP_ID or BASE_URL in .env');
-}
+const APP_ID     = process.env.CLOVER_APP_ID;
+const APP_SECRET = process.env.CLOVER_APP_SECRET; // omit if you switch to PKCE
+const BASE_URL   = process.env.BASE_URL;
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
-app.use(helmet());
+// ---------- security & middleware ----------
+// Allow being embedded in Clover (avoid infinite loader)
+app.use(helmet({ contentSecurityPolicy: false, frameguard: false }));
+app.use((req, res, next) => {
+  // Allow Clover to frame this app
+  res.setHeader(
+    'Content-Security-Policy',
+    "frame-ancestors 'self' https://*.clover.com https://*.dev.clover.com"
+  );
+  next();
+});
+
 app.use(cors());
 app.use(morgan('combined'));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// -------------------- Health --------------------
-app.get('/health', (req, res) => {
-  res.json({ status: 'OK', timestamp: new Date().toISOString() });
+// ---------- simple home so Clover gets 200 ----------
+app.get('/', (req, res) => {
+  res.status(200).send(`
+    <html><body>
+      <h3>zainApp server</h3>
+      <p><a href="/oauth/start">Connect Clover (sandbox)</a></p>
+    </body></html>
+  `);
 });
 
-// -------------------- Clover OAuth --------------------
-// simple in-memory store; replace with DB for real use
+// ---------- health ----------
+app.get('/health', (_, res) =>
+  res.json({ status: 'OK', timestamp: new Date().toISOString() })
+);
+
+// ---------- Clover OAuth ----------
 const merchantTokens = new Map(); // merchantId -> { access_token, refresh_token, expires_at }
 
 app.get('/oauth/start', (req, res) => {
-  try {
-    const state = crypto.randomBytes(16).toString('hex'); // you can persist/verify if you add a session
-    const redirectUri = `${BASE_URL}/oauth/callback`;
+  const state = crypto.randomBytes(16).toString('hex');
+  const redirectUri = `${BASE_URL}/oauth/callback`;
 
-    const params = new URLSearchParams({
-      client_id: APP_ID,
-      response_type: 'code',
-      redirect_uri: redirectUri,
-      state,
-    });
+  const params = new URLSearchParams({
+    client_id: APP_ID,
+    response_type: 'code',
+    redirect_uri: redirectUri,
+    state,
+  });
 
-    const url = `${CLOVER_AUTH_BASE}/oauth/v2/authorize?${params.toString()}`;
-    return res.redirect(url);
-  } catch (e) {
-    console.error('OAuth start error:', e);
-    return res.status(500).send('OAuth start error');
-  }
+  res.redirect(`${CLOVER_AUTH_BASE}/oauth/v2/authorize?${params.toString()}`);
 });
 
 // Clover redirects here with ?code=...&merchant_id=...
@@ -74,44 +80,38 @@ app.get('/oauth/callback', async (req, res) => {
 
     const body = {
       client_id: APP_ID,
-      // If you switch to PKCE (low-trust), remove client_secret and include code_verifier instead.
-      client_secret: APP_SECRET,
+      client_secret: APP_SECRET, // for PKCE, remove and add code_verifier
       code: String(code),
     };
 
-    const tokenResp = await fetch(`${CLOVER_API_BASE}/oauth/v2/token`, {
+    const r = await fetch(`${CLOVER_API_BASE}/oauth/v2/token`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
     });
-
-    const tokenJson = await tokenResp.json();
-
-    if (!tokenResp.ok) {
-      console.error('Token exchange failed:', tokenJson);
-      return res
-        .status(tokenResp.status)
-        .send(`Token exchange failed: ${JSON.stringify(tokenJson)}`);
+    const j = await r.json();
+    if (!r.ok) {
+      console.error('Token exchange failed:', j);
+      return res.status(r.status).send(`Token exchange failed: ${JSON.stringify(j)}`);
     }
 
-    const { access_token, refresh_token, expires_in } = tokenJson;
+    const { access_token, refresh_token, expires_in } = j;
     merchantTokens.set(String(merchant_id), {
       access_token,
       refresh_token,
       expires_at: Date.now() + (expires_in || 0) * 1000,
     });
 
-    // Success page (you can redirect to your UI instead)
-    return res
-      .status(200)
-      .send(`Clover connected for merchant ${merchant_id}. You can call APIs now.`);
+    res.status(200).send(
+      `Clover connected for merchant ${merchant_id}. ` +
+      `Try <a href="/clover/me?merchant_id=${merchant_id}">/clover/me</a>.`
+    );
   } catch (e) {
     console.error('OAuth callback error:', e);
-    return res.status(500).send('OAuth callback error');
+    res.status(500).send('OAuth callback error');
   }
 });
 
-// Quick test route to call Clover using stored token
 app.get('/clover/me', async (req, res) => {
   const merchantId = String(req.query.merchant_id || '');
   const t = merchantTokens.get(merchantId);
@@ -120,25 +120,11 @@ app.get('/clover/me', async (req, res) => {
   const r = await fetch(`${CLOVER_API_BASE}/v3/merchants/${merchantId}`, {
     headers: { Authorization: `Bearer ${t.access_token}`, Accept: 'application/json' },
   });
-  const json = await r.json();
-  return res.status(r.ok ? 200 : r.status).json(json);
+  const j = await r.json();
+  res.status(r.ok ? 200 : r.status).json(j);
 });
 
-// Another small test: items list
-app.get('/clover/items', async (req, res) => {
-  const merchantId = String(req.query.merchant_id || '');
-  const limit = req.query.limit || '5';
-  const t = merchantTokens.get(merchantId);
-  if (!t) return res.status(400).send('No token stored for that merchant_id');
-
-  const r = await fetch(`${CLOVER_API_BASE}/v3/merchants/${merchantId}/items?limit=${limit}`, {
-    headers: { Authorization: `Bearer ${t.access_token}`, Accept: 'application/json' },
-  });
-  const json = await r.json();
-  return res.status(r.ok ? 200 : r.status).json(json);
-});
-
-// -------------------- Retell endpoints (unchanged) --------------------
+// ---------- Retell endpoints (unchanged) ----------
 app.get('/api/calls/:callId', async (req, res) => {
   try {
     const { callId } = req.params;
@@ -207,19 +193,6 @@ app.post('/webhook/call-events', (req, res) => {
   try {
     const event = req.body;
     console.log('Received call event:', event);
-    switch (event.event_type) {
-      case 'call_started':
-        console.log('Call started:', event.call_id);
-        break;
-      case 'call_ended':
-        console.log('Call ended:', event.call_id);
-        break;
-      case 'transcript_updated':
-        console.log('Transcript updated for call:', event.call_id);
-        break;
-      default:
-        console.log('Unknown event type:', event.event_type);
-    }
     res.json({ success: true });
   } catch (error) {
     console.error('Error processing webhook:', error);
@@ -227,7 +200,7 @@ app.post('/webhook/call-events', (req, res) => {
   }
 });
 
-// -------------------- Errors & 404 --------------------
+// ---------- errors & 404 ----------
 app.use((err, req, res, next) => {
   console.error(err.stack);
   res.status(500).json({ success: false, error: 'Something went wrong!' });
@@ -239,6 +212,6 @@ app.use('*', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
+  console.log(`Health: ${BASE_URL}/health`);
   console.log(`OAuth start: ${BASE_URL}/oauth/start`);
 });

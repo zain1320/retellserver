@@ -14,25 +14,23 @@ const retellClient = new Retell({ apiKey: process.env.RETELL_API_KEY });
 const CLOVER_AUTH_BASE = 'https://sandbox.dev.clover.com';
 const CLOVER_API_BASE  = 'https://apisandbox.dev.clover.com';
 
-const APP_ID     = process.env.CLOVER_APP_ID;
-const APP_SECRET = process.env.CLOVER_APP_SECRET; // omit if you switch to PKCE
-const BASE_URL   = process.env.BASE_URL;
+const APP_ID     = process.env.CLOVER_APP_ID;       // your Clover App ID (client_id)
+const APP_SECRET = process.env.CLOVER_APP_SECRET;   // keep if using high-trust; omit for PKCE
+const BASE_URL   = process.env.BASE_URL || 'http://localhost:3000';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ---------- security & middleware ----------
-// Allow being embedded in Clover (avoid infinite loader)
+// Allow being embedded by Clover and avoid CSP/frame blocking inside Clover iframe
 app.use(helmet({ contentSecurityPolicy: false, frameguard: false }));
 app.use((req, res, next) => {
-  // Allow Clover to frame this app
   res.setHeader(
     'Content-Security-Policy',
     "frame-ancestors 'self' https://*.clover.com https://*.dev.clover.com"
   );
   next();
 });
-
 app.use(cors());
 app.use(morgan('combined'));
 app.use(express.json());
@@ -41,6 +39,7 @@ app.use(express.urlencoded({ extended: true }));
 // ---------- simple home so Clover gets 200 ----------
 app.get('/', (req, res) => {
   res.status(200).send(`
+    <!doctype html>
     <html><body>
       <h3>zainApp server</h3>
       <p><a href="/oauth/start">Connect Clover (sandbox)</a></p>
@@ -56,21 +55,44 @@ app.get('/health', (_, res) =>
 // ---------- Clover OAuth ----------
 const merchantTokens = new Map(); // merchantId -> { access_token, refresh_token, expires_at }
 
+/**
+ * START OAuth
+ * Clover opens your app in an iframe; use top-level redirect so the authorize page isn't framed.
+ */
 app.get('/oauth/start', (req, res) => {
-  const state = crypto.randomBytes(16).toString('hex');
+  const state = crypto.randomBytes(16).toString('hex'); // optional: persist/verify if you add a session
   const redirectUri = `${BASE_URL}/oauth/callback`;
 
   const params = new URLSearchParams({
     client_id: APP_ID,
     response_type: 'code',
     redirect_uri: redirectUri,
-    state,
+    state
   });
 
-  res.redirect(`${CLOVER_AUTH_BASE}/oauth/v2/authorize?${params.toString()}`);
+  const authURL = `${CLOVER_AUTH_BASE}/oauth/v2/authorize?${params.toString()}`;
+  console.log('[clover] authorize URL ->', authURL);
+
+  // Send small HTML that forces the parent window (outside iframe) to navigate
+  res.status(200).send(`
+    <!doctype html>
+    <html>
+      <head>
+        <meta http-equiv="refresh" content="0; url='${authURL}'" />
+      </head>
+      <body>
+        <script>window.top.location.href = ${JSON.stringify(authURL)};</script>
+        <noscript><a href="${authURL}" target="_top">Continue to Clover</a></noscript>
+      </body>
+    </html>
+  ');
 });
 
-// Clover redirects here with ?code=...&merchant_id=...
+/**
+ * CALLBACK
+ * Clover redirects here with ?code=...&merchant_id=...
+ * Exchange code -> tokens and store them.
+ */
 app.get('/oauth/callback', async (req, res) => {
   try {
     const { code, merchant_id } = req.query;
@@ -80,16 +102,17 @@ app.get('/oauth/callback', async (req, res) => {
 
     const body = {
       client_id: APP_ID,
-      client_secret: APP_SECRET, // for PKCE, remove and add code_verifier
-      code: String(code),
+      client_secret: APP_SECRET, // if using PKCE, remove this and add code_verifier
+      code: String(code)
     };
 
     const r = await fetch(`${CLOVER_API_BASE}/oauth/v2/token`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
+      body: JSON.stringify(body)
     });
     const j = await r.json();
+
     if (!r.ok) {
       console.error('Token exchange failed:', j);
       return res.status(r.status).send(`Token exchange failed: ${JSON.stringify(j)}`);
@@ -99,29 +122,47 @@ app.get('/oauth/callback', async (req, res) => {
     merchantTokens.set(String(merchant_id), {
       access_token,
       refresh_token,
-      expires_at: Date.now() + (expires_in || 0) * 1000,
+      expires_at: Date.now() + (expires_in || 0) * 1000
     });
 
-    res.status(200).send(
-      `Clover connected for merchant ${merchant_id}. ` +
-      `Try <a href="/clover/me?merchant_id=${merchant_id}">/clover/me</a>.`
-    );
+    res
+      .status(200)
+      .send(
+        `Clover connected for merchant ${merchant_id}. ` +
+        `Try <a href="/clover/me?merchant_id=${merchant_id}">/clover/me</a> or ` +
+        `<a href="/clover/items?merchant_id=${merchant_id}">/clover/items</a>.`
+      );
   } catch (e) {
     console.error('OAuth callback error:', e);
     res.status(500).send('OAuth callback error');
   }
 });
 
+// Quick test: merchant details
 app.get('/clover/me', async (req, res) => {
   const merchantId = String(req.query.merchant_id || '');
   const t = merchantTokens.get(merchantId);
   if (!t) return res.status(400).send('No token stored for that merchant_id');
 
   const r = await fetch(`${CLOVER_API_BASE}/v3/merchants/${merchantId}`, {
-    headers: { Authorization: `Bearer ${t.access_token}`, Accept: 'application/json' },
+    headers: { Authorization: `Bearer ${t.access_token}`, Accept: 'application/json' }
   });
-  const j = await r.json();
-  res.status(r.ok ? 200 : r.status).json(j);
+  const json = await r.json();
+  res.status(r.ok ? 200 : r.status).json(json);
+});
+
+// Quick test: items list
+app.get('/clover/items', async (req, res) => {
+  const merchantId = String(req.query.merchant_id || '');
+  const limit = req.query.limit || '5';
+  const t = merchantTokens.get(merchantId);
+  if (!t) return res.status(400).send('No token stored for that merchant_id');
+
+  const r = await fetch(`${CLOVER_API_BASE}/v3/merchants/${merchantId}/items?limit=${limit}`, {
+    headers: { Authorization: `Bearer ${t.access_token}`, Accept: 'application/json' }
+  });
+  const json = await r.json();
+  res.status(r.ok ? 200 : r.status).json(json);
 });
 
 // ---------- Retell endpoints (unchanged) ----------
@@ -152,9 +193,9 @@ app.get('/api/calls/:callId/transcript', async (req, res) => {
           duration: callDetails.duration,
           status: callDetails.status,
           startTime: callDetails.start_time,
-          endTime: callDetails.end_time,
-        },
-      },
+          endTime: callDetails.end_time
+        }
+      }
     });
   } catch (error) {
     console.error('Error fetching call transcript:', error);
@@ -180,7 +221,7 @@ app.get('/api/agents/:agentId/calls', async (req, res) => {
     const calls = await retellClient.call.listCalls({
       agentId,
       limit: parseInt(limit),
-      offset: parseInt(offset),
+      offset: parseInt(offset)
     });
     res.json({ success: true, data: calls });
   } catch (error) {

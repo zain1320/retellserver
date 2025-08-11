@@ -11,18 +11,19 @@ const crypto = require('crypto');
 const Retell = require('retell-sdk').default;
 const retellClient = new Retell({ apiKey: process.env.RETELL_API_KEY });
 
+// Clover constants
 const CLOVER_AUTH_BASE = 'https://sandbox.dev.clover.com';
 const CLOVER_API_BASE  = 'https://apisandbox.dev.clover.com';
 
-const APP_ID     = process.env.CLOVER_APP_ID;       // your Clover App ID (client_id)
-const APP_SECRET = process.env.CLOVER_APP_SECRET;   // keep if using high-trust; omit for PKCE
+const APP_ID     = process.env.CLOVER_APP_ID;       // Clover App ID (client_id)
+const APP_SECRET = process.env.CLOVER_APP_SECRET;   // keep for high-trust; omit for PKCE
 const BASE_URL   = process.env.BASE_URL || 'http://localhost:3000';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ---------- security & middleware ----------
-// Allow being embedded by Clover and avoid CSP/frame blocking inside Clover iframe
+// Allow being embedded by Clover; avoid CSP/frame blocking inside Clover iframe
 app.use(helmet({ contentSecurityPolicy: false, frameguard: false }));
 app.use((req, res, next) => {
   res.setHeader(
@@ -31,6 +32,7 @@ app.use((req, res, next) => {
   );
   next();
 });
+
 app.use(cors());
 app.use(morgan('combined'));
 app.use(express.json());
@@ -81,11 +83,16 @@ app.get('/oauth/start', (req, res) => {
         <meta http-equiv="refresh" content="0; url='${authURL}'" />
       </head>
       <body>
-        <script>window.top.location.href = ${JSON.stringify(authURL)};</script>
-        <noscript><a href="${authURL}" target="_top">Continue to Clover</a></noscript>
+        <script>
+          // escape Clover iframe to top window
+          window.top.location.href = ${JSON.stringify(authURL)};
+        </script>
+        <noscript>
+          <a href="${authURL}" target="_top">Continue to Clover</a>
+        </noscript>
       </body>
     </html>
-  ');
+  `);
 });
 
 /**
@@ -102,7 +109,8 @@ app.get('/oauth/callback', async (req, res) => {
 
     const body = {
       client_id: APP_ID,
-      client_secret: APP_SECRET, // if using PKCE, remove this and add code_verifier
+      // For PKCE (low-trust) remove client_secret and include code_verifier instead.
+      client_secret: APP_SECRET,
       code: String(code)
     };
 
